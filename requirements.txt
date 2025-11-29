@@ -1,14 +1,14 @@
-# No external dependencies required!
-# This application uses only Python standard library modules:
+# Optional dependency for image support
+# Install with: pip install Pillow
+Pillow>=8.0.0
+
+# Note: The application uses only Python standard library modules:
 # - tkinter (GUI)
-# - subprocess (running wget)
-# - threading (parallel downloads)
-# - ftplib (FTP server scanning)
+# - ftplib (FTP operations)
+# - threading (parallel downloads and scanning)
 # - queue (task management)
 # - os, shutil, re, time, pathlib, urllib.parse
-
-# However, you need wget installed on your system:
-# - Windows: Download from https://eternallybored.org/misc/wget/
-# - Linux: sudo apt-get install wget (or equivalent)
-# - macOS: brew install wget
-
+#
+# Pillow is optional but recommended for:
+# - Status images (success/failed indicators)
+# - Application icon support (donload.png)
