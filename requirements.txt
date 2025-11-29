@@ -1,0 +1,14 @@
+# No external dependencies required!
+# This application uses only Python standard library modules:
+# - tkinter (GUI)
+# - subprocess (running wget)
+# - threading (parallel downloads)
+# - ftplib (FTP server scanning)
+# - queue (task management)
+# - os, shutil, re, time, pathlib, urllib.parse
+
+# However, you need wget installed on your system:
+# - Windows: Download from https://eternallybored.org/misc/wget/
+# - Linux: sudo apt-get install wget (or equivalent)
+# - macOS: brew install wget
+
