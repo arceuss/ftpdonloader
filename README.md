@@ -4,9 +4,10 @@ A multi-threaded GUI FTP downloader built with Python and tkinter. Perfect for a
 
 ## Features
 
-- **Multi-threaded Downloads**: Uses multiple parallel worker threads with Python's `ftplib` for fast concurrent downloads
+- **Multi-threaded Downloads**: Uses multiple parallel worker threads with `ftputil` for fast concurrent downloads
+- **Timestamp Preservation**: Automatically preserves file modification timestamps from the FTP server
 - **Real-time File Discovery**: Files appear in the download list as they're discovered, with 4 parallel scanners for optimal speed
-- **Optimized Scanning**: Prioritizes faster FTP listing methods (MLSD, NLST) and includes PureFTPd-specific optimizations (`LIST -R`)
+- **Optimized Scanning**: Uses `ftputil`'s `listdir` API and includes PureFTPd-specific optimizations (`LIST -R`) for faster scanning
 - **Test Connection**: Test FTP connectivity and retrieve server information before downloading
 - **Duplicate Prevention**: Automatically skips files that are already downloaded or currently downloading
 - **Progress Tracking**: Real-time statistics including download speed, completed/failed counts, and per-file status
@@ -19,22 +20,31 @@ A multi-threaded GUI FTP downloader built with Python and tkinter. Perfect for a
 ## Requirements
 
 - Python 3.6 or higher
-- tkinter (usually included with Python)
-- Pillow (optional, for status images and icon support)
+- `ftputil` (required, for FTP operations with timestamp preservation)
+- `tkinter` (usually included with Python)
+- `Pillow` (optional, for status images and icon support)
 
 ## Installation
 
 1. Install Python 3.6 or higher if you haven't already
 
-2. (Optional) Install Pillow for image support:
+2. Install required dependencies:
+   ```bash
+   pip install ftputil
+   ```
+   Or install all dependencies including optional ones:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. (Optional) Install Pillow for image support:
    ```bash
    pip install Pillow
    ```
    The application will work without Pillow, but status images won't be displayed.
 
-3. No other dependencies required - the application uses only Python standard library modules:
+4. The application also uses Python standard library modules:
    - `tkinter` (GUI)
-   - `ftplib` (FTP operations)
    - `threading` (parallel downloads and scanning)
    - `queue` (task management)
    - `os`, `shutil`, `re`, `time`, `pathlib`, `urllib.parse`
@@ -81,15 +91,16 @@ A multi-threaded GUI FTP downloader built with Python and tkinter. Perfect for a
 ## How It Works
 
 1. **Scanning Phase**: 
-   - Uses 4 parallel scanner threads to discover files
-   - Prioritizes faster FTP listing methods: `MLSD` → `NLST` → `LIST`
+   - Uses 4 parallel scanner threads with `ftputil` to discover files
+   - Uses `ftputil`'s `listdir()` API for clean directory listing
    - For PureFTPd servers, attempts `LIST -R` for faster recursive scanning
    - Files are added to the download queue and UI as they're discovered
 
 2. **Download Phase**: 
    - Creates multiple worker threads (configurable, default: 4)
-   - Each worker maintains its own FTP connection
+   - Each worker maintains its own `ftputil.FTPHost` connection
    - Files are distributed to available workers via a queue system
+   - Downloads preserve file modification timestamps from the server
    - Duplicate downloads are prevented by tracking downloaded/downloading files
 
 3. **Progress Tracking**: 
@@ -109,9 +120,11 @@ A multi-threaded GUI FTP downloader built with Python and tkinter. Perfect for a
 ## Troubleshooting
 
 - **Connection errors**: Use the "Test Connection" button to verify your FTP server address, port, and credentials
+- **"504 Unknown command" errors**: Some FTP servers don't support UTF-8 encoding. The application automatically handles this with a custom session factory
 - **Slow downloads**: Try adjusting the number of threads or check your network connection
 - **Missing images**: Install Pillow (`pip install Pillow`) if status images aren't displaying
 - **Files not appearing**: Check the log area for scanner errors or connection issues
+- **Installation issues**: Make sure `ftputil` is installed: `pip install ftputil`
 
 ## License
 
