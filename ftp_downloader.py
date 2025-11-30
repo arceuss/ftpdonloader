@@ -489,6 +489,7 @@ class FTPDownloaderGUI:
             'errors': [],
             'lock': threading.Lock(),
             'bytes_downloaded': 0,  # Total bytes downloaded
+            'total_size': 0,  # Total size of all files to download (in bytes)
             'download_start_time': None,  # When download started
             'last_bytes': 0,  # Bytes at last speed calculation
             'last_speed_time': None,  # Time of last speed calculation
@@ -938,6 +939,15 @@ class FTPDownloaderGUI:
                     # Add file to list
                     size = info.get('size', 'Unknown')
                     self.file_list.append((remote_path, size))
+                    # Update stats
+                    with self.stats['lock']:
+                        self.stats['total'] += 1
+                        # Add file size to total size (parse size - could be string or int)
+                        if isinstance(size, (int, float)):
+                            size_bytes = int(size)
+                        else:
+                            size_bytes = self._parse_size(size)
+                        self.stats['total_size'] += size_bytes
                     # Update UI periodically
                     if len(self.file_list) % 100 == 0:
                         count = len(self.file_list)
@@ -1180,6 +1190,12 @@ class FTPDownloaderGUI:
                         # Update stats
                         with self.stats['lock']:
                             self.stats['total'] += 1
+                            # Add file size to total size (parse size - could be string or int)
+                            if isinstance(size, (int, float)):
+                                size_bytes = int(size)
+                            else:
+                                size_bytes = self._parse_size(size)
+                            self.stats['total_size'] += size_bytes
                         
                         # Batch UI updates
                         if len(self.file_list) % 20 == 0:
@@ -1322,6 +1338,8 @@ class FTPDownloaderGUI:
                 
                 # Update file list for UI
                 size = info.get('size', 'Unknown')
+                # Get raw size in bytes for total_size calculation
+                size_bytes = self._parse_size(size) if not isinstance(size, (int, float)) else (int(size) if isinstance(size, (int, float)) else 0)
                 if isinstance(size, (int, float)):
                     # Format size for display
                     if size >= 1024 * 1024 * 1024:
@@ -1340,6 +1358,8 @@ class FTPDownloaderGUI:
                 # Increment total count when file is discovered (not when processed)
                 with self.stats['lock']:
                     self.stats['total'] += 1
+                    # Add file size to total size (use raw bytes, not formatted string)
+                    self.stats['total_size'] += size_bytes
                 
                 # Batch UI updates for better performance (update every 20 files for less overhead)
                 if len(self.file_list) % 20 == 0:
@@ -1492,11 +1512,19 @@ class FTPDownloaderGUI:
                 
                 # Update file list for UI
                 size = info.get('size', 'Unknown')
+                # Get raw size in bytes for total_size calculation
+                if isinstance(size, (int, float)):
+                    size_bytes = int(size)
+                else:
+                    size_bytes = self._parse_size(size)
+                
                 self.file_list.append((remote_path, size))
                 
                 # Increment total count when file is discovered (not when processed)
                 with self.stats['lock']:
                     self.stats['total'] += 1
+                    # Add file size to total size (use raw bytes)
+                    self.stats['total_size'] += size_bytes
                 
                 # Batch UI updates for better performance (update every 20 files for less overhead)
                 if len(self.file_list) % 20 == 0:
@@ -1824,8 +1852,13 @@ class FTPDownloaderGUI:
         else:
             speed_str = f"{speed:.0f} B/s"
         
-        # Update stats (always include speed)
-        self.stats_var.set(f"Files: {total} | Completed: {completed} | Success: {success} | Failed: {failed} | Speed: {speed_str}")
+        # Get total size and format it
+        with self.stats['lock']:
+            total_size = self.stats.get('total_size', 0)
+        total_size_str = self._format_size(total_size) if total_size > 0 else "Unknown"
+        
+        # Update stats (always include speed and total size)
+        self.stats_var.set(f"Files: {total} | Total Size: {total_size_str} | Completed: {completed} | Success: {success} | Failed: {failed} | Speed: {speed_str}")
         
         if is_complete:
             # Increment consecutive completion checks
@@ -1959,8 +1992,13 @@ class FTPDownloaderGUI:
                         else:
                             final_speed_str = f"{final_speed:.0f} B/s"
                         
-                        # Update stats one final time (include speed)
-                        self.stats_var.set(f"Files: {final_total} | Completed: {final_completed} | Success: {final_success} | Failed: {final_failed} | Speed: {final_speed_str}")
+                        # Get final total size and format it
+                        with self.stats['lock']:
+                            final_total_size = self.stats.get('total_size', 0)
+                        final_total_size_str = self._format_size(final_total_size) if final_total_size > 0 else "Unknown"
+                        
+                        # Update stats one final time (include speed and total size)
+                        self.stats_var.set(f"Files: {final_total} | Total Size: {final_total_size_str} | Completed: {final_completed} | Success: {final_success} | Failed: {final_failed} | Speed: {final_speed_str}")
                         
                         if final_errors:
                             self.log(f"Download complete with {len(final_errors)} errors")
@@ -2019,6 +2057,7 @@ class FTPDownloaderGUI:
             self.stats['failed'] = 0
             self.stats['errors'] = []
             self.stats['bytes_downloaded'] = 0
+            self.stats['total_size'] = 0  # Total size of all files to download
             self.stats['download_start_time'] = time.time()
             self.stats['last_bytes'] = 0
             self.stats['last_speed_time'] = time.time()
@@ -2310,6 +2349,12 @@ class FTPDownloaderGUI:
                                 # Update stats
                                 with self.stats['lock']:
                                     self.stats['total'] += 1
+                                    # Add file size to total size (parse size - could be string or int)
+                                    if isinstance(size, (int, float)):
+                                        size_bytes = int(size)
+                                    else:
+                                        size_bytes = self._parse_size(size)
+                                    self.stats['total_size'] += size_bytes
                                 
                                 if len(self.file_list) % 100 == 0:
                                     count = len(self.file_list)
@@ -2372,7 +2417,12 @@ class FTPDownloaderGUI:
         else:
             speed_str = f"{speed:.0f} B/s"
         
-        self.stats_var.set(f"Files: {total} | Completed: {completed} | Success: {success} | Failed: {failed} | Speed: {speed_str}")
+        # Get total size and format it
+        with self.stats['lock']:
+            total_size = self.stats.get('total_size', 0)
+        total_size_str = self._format_size(total_size) if total_size > 0 else "Unknown"
+        
+        self.stats_var.set(f"Files: {total} | Total Size: {total_size_str} | Completed: {completed} | Success: {success} | Failed: {failed} | Speed: {speed_str}")
         
         # Check if done
         if completed >= total and total > 0:
@@ -2492,6 +2542,31 @@ class FTPDownloaderGUI:
         """Callback for file download progress"""
         # Progress bar removed - file status is shown in the treeview
         pass
+    
+    def _format_size(self, size_bytes):
+        """Format file size into human-readable units"""
+        if size_bytes >= 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+        elif size_bytes >= 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.2f} MB"
+        elif size_bytes >= 1024:
+            return f"{size_bytes / 1024:.2f} KB"
+        else:
+            return f"{size_bytes} B"
+    
+    def _parse_size(self, size):
+        """Parse file size from various formats (int, string, etc.) and return bytes"""
+        if isinstance(size, int):
+            return size
+        if isinstance(size, str):
+            if size == 'Unknown' or size == '':
+                return 0
+            # Try to parse as integer
+            try:
+                return int(size)
+            except ValueError:
+                return 0
+        return 0
     
     def stop_download(self):
         """Stop downloading"""
