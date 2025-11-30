@@ -1,10 +1,14 @@
+# Required dependency for FTP operations with timestamp preservation
+# Install with: pip install ftputil
+ftputil>=5.0.0
+
 # Optional dependency for image support
 # Install with: pip install Pillow
 Pillow>=8.0.0
 
-# Note: The application uses only Python standard library modules:
+# Note: The application uses ftputil (built on ftplib) for FTP operations:
+# - ftputil (FTP operations with timestamp preservation)
 # - tkinter (GUI)
-# - ftplib (FTP operations)
 # - threading (parallel downloads and scanning)
 # - queue (task management)
 # - os, shutil, re, time, pathlib, urllib.parse

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Multi-threaded GUI FTP Downloader using wget
-A GUI wrapper for wget with parallel download support for FTP servers
+Multi-threaded GUI FTP Downloader
+A GUI application for downloading files from FTP servers with timestamp preservation
 """
 
 import tkinter as tk
@@ -14,12 +14,30 @@ import time
 import shutil
 import re
 import ftplib
+import ftputil
 from pathlib import Path
 from urllib.parse import quote
 
 
+def create_no_utf8_session_factory(base_class, port=21, use_passive_mode=True, encrypt_data_channel=False):
+    """Create a session factory that doesn't send OPTS UTF8 ON command"""
+    def session_factory(host, username, password):
+        # Create the base FTP connection manually without UTF8 command
+        session = base_class()
+        session.connect(host, port)
+        if username or password:
+            session.login(username, password)
+        if use_passive_mode:
+            session.set_pasv(True)
+        if encrypt_data_channel and hasattr(session, 'prot_p'):
+            session.prot_p()
+        return session
+    
+    return session_factory
+
+
 class DownloadWorker(threading.Thread):
-    """Worker thread for downloading files recursively using ftplib"""
+    """Worker thread for downloading files using ftputil (preserves timestamps)"""
     def __init__(self, worker_id, download_queue, stats, host, port, 
                  local_dir, progress_callback, status_callback, username='', password='', use_tls=False, remote_base='/'):
         super().__init__(daemon=True)
@@ -36,26 +54,48 @@ class DownloadWorker(threading.Thread):
         self.use_tls = use_tls
         self.remote_base = remote_base
         self.running = True
-        self.ftp = None
+        self.ftp_host = None
         self.downloaded_paths = set()  # Track downloaded paths to avoid duplicates
         
     def run(self):
         """Main worker loop - pulls files from queue and downloads them"""
-        # Connect to FTP server once per worker
+        # Connect to FTP server once per worker using ftputil
         try:
+            # Create session factory that doesn't send UTF8 command
             if self.use_tls:
-                self.ftp = ftplib.FTP_TLS()
-                self.ftp.connect(self.host, self.port)
-                self.ftp.login(self.username, self.password)
-                self.ftp.prot_p()
+                session_factory = create_no_utf8_session_factory(
+                    base_class=ftplib.FTP_TLS,
+                    port=self.port,
+                    use_passive_mode=True,
+                    encrypt_data_channel=True
+                )
             else:
-                self.ftp = ftplib.FTP()
-                self.ftp.connect(self.host, self.port)
-                if self.username or self.password:
-                    self.ftp.login(self.username, self.password)
+                session_factory = create_no_utf8_session_factory(
+                    base_class=ftplib.FTP,
+                    port=self.port,
+                    use_passive_mode=True,
+                    encrypt_data_channel=False
+                )
+            
+            # Create FTPHost with custom session factory (no UTF8 command will be sent)
+            self.ftp_host = ftputil.FTPHost(self.host, self.username, self.password,
+                                           session_factory=session_factory)
+            
+            # Synchronize times for accurate timestamp preservation
+            try:
+                self.ftp_host.synchronize_times()
+            except Exception:
+                pass  # Continue even if time sync fails
+                
         except Exception as e:
+            error_msg = f"Worker {self.worker_id} connection failed: {str(e)}"
             with self.stats['lock']:
-                self.stats['errors'].append(f"Worker {self.worker_id} connection failed: {str(e)}")
+                self.stats['errors'].append(error_msg)
+            # Log to console/stderr so user can see the error
+            import sys
+            print(f"ERROR: {error_msg}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
             return
         
         # Pull tasks from queue and download
@@ -164,12 +204,12 @@ class DownloadWorker(threading.Thread):
                     self.stats['errors'].append(f"Worker {self.worker_id} error: {str(e)}")
         
         # Disconnect when done
-        if self.ftp:
+        if self.ftp_host:
             try:
-                self.ftp.quit()
+                self.ftp_host.close()
             except:
-                self.ftp.close()
-            self.ftp = None
+                pass
+            self.ftp_host = None
     
     def _download_recursive(self, current_path, base_path):
         """Recursively download all files from a directory"""
@@ -290,138 +330,110 @@ class DownloadWorker(threading.Thread):
                 self.stats['errors'].append(f"Error in {current_path}: {str(e)}")
     
     def _download_file(self, remote_path, local_path):
-        """Download a single file using FTP"""
-        # Change to the directory containing the file
-        remote_dir = os.path.dirname(remote_path).replace('\\', '/')
-        filename = os.path.basename(remote_path)
+        """Download a single file using ftputil (preserves timestamps)"""
+        # ftputil works with paths relative to current directory or absolute paths
+        # Normalize the path - try both absolute (with /) and relative (without /)
+        remote_path_normalized = remote_path
+        if not remote_path.startswith('/'):
+            remote_path_normalized = '/' + remote_path
         
-        # Ensure we're in the correct directory
-        if remote_dir and remote_dir != '/':
-            try:
-                self.ftp.cwd(remote_dir)
-            except Exception as e:
-                raise Exception(f"Could not change to directory {remote_dir}: {str(e)}")
-        else:
-            self.ftp.cwd('/')
-        
-        # retrbinary will automatically set binary mode, no need to do it explicitly
+        remote_path_alt = remote_path.lstrip('/')
         
         # Get file size for progress tracking
-        # Try with filename first, then try with quoted filename if that fails
         file_size = None
-        try:
-            file_size = self.ftp.size(filename)
-        except:
-            # Try with quoted filename (some servers need this for spaces)
+        working_path = None
+        for try_path in [remote_path_normalized, remote_path_alt]:
             try:
-                quoted_filename = f'"{filename}"'
-                file_size = self.ftp.size(quoted_filename)
-                filename = quoted_filename  # Use quoted version for RETR too
-            except:
-                # Try with full path
-                try:
-                    if remote_path.startswith('/'):
-                        file_size = self.ftp.size(remote_path)
-                        filename = remote_path  # Use full path for RETR
-                    else:
-                        file_size = None
-                except:
-                    file_size = None
-        
+                file_size = self.ftp_host.path.getsize(try_path)
+                working_path = try_path
+                break
+            except Exception:
+                continue
+
         downloaded = 0
         start_time = time.time()
         last_update_time = start_time
         last_bytes = 0
-        
-        def callback(data):
-            nonlocal downloaded, last_update_time, last_bytes
-            data_len = len(data)
-            downloaded += data_len
-            current_time = time.time()
-            
-            # Update total bytes downloaded for speed calculation
-            with self.stats['lock']:
-                self.stats['bytes_downloaded'] += data_len
-            
-            # Calculate speed for this file (update every 0.5 seconds)
-            if current_time - last_update_time >= 0.5:
-                elapsed = current_time - last_update_time
-                bytes_since_last = downloaded - last_bytes
-                file_speed = bytes_since_last / elapsed if elapsed > 0 else 0
-                last_update_time = current_time
-                last_bytes = downloaded
-                
-                # Format speed
-                if file_speed >= 1024 * 1024:
-                    speed_str = f"{file_speed / (1024 * 1024):.1f} MB/s"
-                elif file_speed >= 1024:
-                    speed_str = f"{file_speed / 1024:.1f} KB/s"
-                else:
-                    speed_str = f"{file_speed:.0f} B/s"
-                
-                if file_size and self.status_callback:
-                    percent = int((downloaded / file_size) * 100)
-                    self.status_callback(remote_path, f"Downloading {percent}%", speed_str)
-                if self.progress_callback and file_size:
-                    percent = int((downloaded / file_size) * 100)
-                    self.progress_callback(self.worker_id, remote_path, percent)
-            else:
-                # Still update status but not speed
-                if file_size and self.status_callback:
-                    percent = int((downloaded / file_size) * 100)
-                    self.status_callback(remote_path, f"Downloading {percent}%")
-                if self.progress_callback and file_size:
-                    percent = int((downloaded / file_size) * 100)
-                    self.progress_callback(self.worker_id, remote_path, percent)
-            return data
-        
-        # Download the file - preserve exact directory structure
-        # Try multiple methods to handle filenames with spaces/special characters
+        chunk_size = 8192  # 8KB chunks for progress updates
+
+        # Download file using ftputil's open() method for progress tracking
+        # Try both path formats if needed
         download_succeeded = False
         last_error = None
         
-        # Method 1: Try original filename
-        try:
-            with open(local_path, 'wb') as f:
-                self.ftp.retrbinary(f'RETR {filename}', lambda data: f.write(callback(data)))
-            download_succeeded = True
-        except ftplib.error_perm as e:
-            # File not found or permission error - try other methods
-            last_error = e
-            if '550' not in str(e) and 'not found' not in str(e).lower():
-                # Real permission error, don't try other methods
-                raise
-        except ftplib.error_temp as e:
-            # Temporary error - try other methods
-            last_error = e
-        except Exception as e:
-            # Other errors - try other methods
-            last_error = e
-        
-        # Method 2: Try quoted filename (for spaces)
-        if not download_succeeded:
+        for try_path in [working_path, remote_path_normalized, remote_path_alt]:
+            if try_path is None:
+                continue
             try:
-                quoted_filename = f'"{filename}"'
-                with open(local_path, 'wb') as f:
-                    self.ftp.retrbinary(f'RETR {quoted_filename}', lambda data: f.write(callback(data)))
+                with self.ftp_host.open(try_path, 'rb') as remote_file:
+                    with open(local_path, 'wb') as local_file:
+                        while True:
+                            chunk = remote_file.read(chunk_size)
+                            if not chunk:
+                                break
+                            
+                            data_len = len(chunk)
+                            local_file.write(chunk)
+                            downloaded += data_len
+                            current_time = time.time()
+
+                            # Update total bytes downloaded for speed calculation
+                            with self.stats['lock']:
+                                self.stats['bytes_downloaded'] += data_len
+
+                            # Calculate speed for this file (update every 0.5 seconds)
+                            if current_time - last_update_time >= 0.5:
+                                elapsed = current_time - last_update_time
+                                bytes_since_last = downloaded - last_bytes
+                                file_speed = bytes_since_last / elapsed if elapsed > 0 else 0
+                                last_update_time = current_time
+                                last_bytes = downloaded
+
+                                # Format speed
+                                if file_speed >= 1024 * 1024:
+                                    speed_str = f"{file_speed / (1024 * 1024):.1f} MB/s"
+                                elif file_speed >= 1024:
+                                    speed_str = f"{file_speed / 1024:.1f} KB/s"
+                                else:
+                                    speed_str = f"{file_speed:.0f} B/s"
+
+                                if file_size and self.status_callback:
+                                    percent = int((downloaded / file_size) * 100) if file_size else 0
+                                    self.status_callback(remote_path, f"Downloading {percent}%", speed_str)
+                                if self.progress_callback and file_size:
+                                    percent = int((downloaded / file_size) * 100) if file_size else 0
+                                    self.progress_callback(self.worker_id, remote_path, percent)
+                            else:
+                                # Still update status but not speed
+                                if file_size and self.status_callback:
+                                    percent = int((downloaded / file_size) * 100) if file_size else 0
+                                    self.status_callback(remote_path, f"Downloading {percent}%")
+                                if self.progress_callback and file_size:
+                                    percent = int((downloaded / file_size) * 100) if file_size else 0
+                                    self.progress_callback(self.worker_id, remote_path, percent)
+                
+                # Preserve the modification time from the remote file
+                try:
+                    # Use the working path that succeeded
+                    mtime_path = working_path if working_path else try_path
+                    remote_mtime = self.ftp_host.path.getmtime(mtime_path)
+                    # Set the modification time on the local file
+                    os.utime(local_path, (remote_mtime, remote_mtime))
+                except Exception:
+                    # If we can't get/set the mtime, continue anyway (file is downloaded)
+                    pass
+                
                 download_succeeded = True
-            except:
-                pass
-        
-        # Method 3: Try full path (if not already tried)
-        if not download_succeeded and remote_path.startswith('/') and remote_path != f'/{filename}':
-            try:
-                with open(local_path, 'wb') as f:
-                    self.ftp.retrbinary(f'RETR {remote_path}', lambda data: f.write(callback(data)))
-                download_succeeded = True
-            except:
-                pass
+                break  # Success, exit the loop
+                
+            except Exception as e:
+                last_error = e
+                continue  # Try next path format
         
         if not download_succeeded:
-            # All methods failed, raise error with details
             error_msg = str(last_error) if last_error else "Unknown error"
             # Check for common FTP error codes and provide better messages
-            if '550' in error_msg or 'not found' in error_msg.lower():
+            if '550' in error_msg or 'not found' in error_msg.lower() or 'No such file' in error_msg:
                 raise Exception(f"File not found: {error_msg}")
             elif '150' in error_msg:
                 # 150 is "opening data connection" - might indicate timeout
@@ -432,11 +444,11 @@ class DownloadWorker(threading.Thread):
     def stop(self):
         """Stop the worker"""
         self.running = False
-        if self.ftp:
+        if self.ftp_host:
             try:
-                self.ftp.quit()
+                self.ftp_host.close()
             except:
-                self.ftp.close()
+                pass
 
 
 class FTPDownloaderGUI:
@@ -1075,11 +1087,8 @@ class FTPDownloaderGUI:
                             self.root.after(0, lambda batch=batch_files: self._batch_add_files_to_treeview(batch))
                         
                         # Log progress
-                        if len(self.file_list) % 200 == 0:
-                            count = len(self.file_list)
-                            with self.stats['lock']:
-                                total_count = self.stats['total']
-                            self.root.after(0, lambda c=count, t=total_count: self.log(f"Discovered {c} files from recursive listing... (Total: {t})"))
+                        if files_found % 200 == 0:
+                            self.root.after(0, lambda f=files_found: self.log(f"Discovered {f} files from recursive listing..."))
             
             # Add remaining files to treeview
             if len(self.file_list) > 0:
@@ -1093,6 +1102,7 @@ class FTPDownloaderGUI:
                 self.root.after(0, lambda: self.log("Warning: Recursive listing returned no files, falling back to standard scanning."))
                 return False
             
+            # Log final count - use files_found which is accurate for this recursive listing
             self.root.after(0, lambda f=files_found, d=len(dirs_found): self.log(f"Recursive listing complete! Found {f} files in {d} directories."))
             self.root.after(0, lambda: self.log("Recursive listing succeeded - standard scanners will verify completeness."))
             
@@ -1106,6 +1116,150 @@ class FTPDownloaderGUI:
         except Exception as e:
             self.root.after(0, lambda: self.log(f"Recursive LIST failed, falling back to standard scanning: {str(e)}"))
             return False
+    
+    def _scan_and_queue_files_ftputil(self, ftp_host, current_path, base_path, local_dir, dir_queue=None):
+        """Recursively scan FTP directory using ftputil and queue files for download
+        
+        If dir_queue is provided, directories are added to the queue for parallel processing.
+        Otherwise, directories are processed recursively in this thread.
+        """
+        try:
+            # Check if this directory has already been scanned (for parallel scanners)
+            if dir_queue is not None:
+                with self.scanned_dirs_lock:
+                    if current_path in self.scanned_dirs:
+                        return  # Already scanned by another scanner
+                    self.scanned_dirs.add(current_path)
+            
+            # Normalize path for ftputil (it works with absolute paths)
+            if not current_path.startswith('/'):
+                current_path = '/' + current_path
+            
+            # Change to current directory
+            try:
+                ftp_host.chdir(current_path)
+            except Exception:
+                return  # Can't access this directory
+            
+            # Use ftputil's listdir to get directory contents
+            try:
+                items = ftp_host.listdir(ftp_host.curdir)
+            except Exception:
+                return  # Can't list directory
+            
+            # Separate files and directories
+            dirs = []
+            files = []
+            
+            for name in items:
+                if name in ['.', '..']:
+                    continue
+                
+                # Build full path
+                if current_path == '/':
+                    remote_path = f"/{name}"
+                else:
+                    remote_path = f"{current_path.rstrip('/')}/{name}"
+                remote_path = remote_path.replace('\\', '/')
+                
+                # Use ftputil's isfile/isdir to check type
+                # After chdir, we can use relative paths (just the name)
+                try:
+                    if ftp_host.path.isdir(name):
+                        dirs.append(remote_path)
+                    elif ftp_host.path.isfile(name):
+                        # Get file size
+                        try:
+                            size = ftp_host.path.getsize(name)
+                            files.append((remote_path, {'type': 'file', 'size': size}))
+                        except Exception:
+                            files.append((remote_path, {'type': 'file', 'size': 'Unknown'}))
+                except Exception:
+                    # If we can't determine type, skip it
+                    continue
+            
+            # Queue files first
+            for remote_path, info in files:
+                # Check if file is already downloaded, downloading, or queued
+                with self.stats['lock']:
+                    # Check if already downloaded
+                    if 'downloaded_paths' in self.stats and remote_path in self.stats['downloaded_paths']:
+                        continue  # Skip already downloaded files
+                    
+                    # Check if currently downloading
+                    if 'downloading_paths' in self.stats and remote_path in self.stats['downloading_paths']:
+                        continue  # Skip files currently being downloaded
+                
+                # Check if already in file_list (already queued)
+                if any(fp == remote_path for fp, _ in self.file_list):
+                    continue  # Skip files already in the list
+                
+                # Calculate local path - preserve exact 1:1 structure
+                if remote_path.startswith('/'):
+                    rel_path = remote_path[1:]
+                else:
+                    rel_path = remote_path
+                
+                local_path = os.path.join(local_dir, rel_path)
+                
+                # Check if file already exists locally
+                if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                    # File already exists, mark as downloaded
+                    with self.stats['lock']:
+                        if 'downloaded_paths' not in self.stats:
+                            self.stats['downloaded_paths'] = set()
+                        self.stats['downloaded_paths'].add(remote_path)
+                    continue  # Skip already existing files
+                
+                # Add to queue
+                self.download_queue.put((remote_path, local_path))
+                
+                # Update file list for UI
+                size = info.get('size', 'Unknown')
+                if isinstance(size, (int, float)):
+                    # Format size for display
+                    if size >= 1024 * 1024 * 1024:
+                        size_str = f"{size / (1024 * 1024 * 1024):.2f} GB"
+                    elif size >= 1024 * 1024:
+                        size_str = f"{size / (1024 * 1024):.2f} MB"
+                    elif size >= 1024:
+                        size_str = f"{size / 1024:.2f} KB"
+                    else:
+                        size_str = f"{size} B"
+                else:
+                    size_str = str(size)
+                
+                self.file_list.append((remote_path, size_str))
+                
+                # Increment total count when file is discovered (not when processed)
+                with self.stats['lock']:
+                    self.stats['total'] += 1
+                
+                # Batch UI updates for better performance (update every 20 files for less overhead)
+                if len(self.file_list) % 20 == 0:
+                    # Batch update UI
+                    batch_files = self.file_list[-20:]
+                    self.root.after(0, lambda batch=batch_files: self._batch_add_files_to_treeview(batch))
+                
+                # Log progress periodically (less frequent to reduce overhead)
+                if len(self.file_list) % 200 == 0:
+                    count = len(self.file_list)
+                    with self.stats['lock']:
+                        total_count = self.stats['total']
+                    self.root.after(0, lambda c=count, t=total_count: self.log(f"Discovered {c} files, queued for download... (Total: {t})"))
+            
+            # Then recursively scan directories
+            if dir_queue is not None:
+                # Parallel scanning - add directories to queue
+                for remote_path in dirs:
+                    dir_queue.put(remote_path)
+            else:
+                # Sequential scanning - process directories recursively
+                for remote_path in dirs:
+                    self._scan_and_queue_files_ftputil(ftp_host, remote_path, base_path, local_dir, dir_queue)
+                
+        except Exception as e:
+            pass  # Silently continue on errors
     
     def _scan_and_queue_files(self, ftp, current_path, base_path, local_dir, dir_queue=None):
         """Recursively scan FTP directory and queue files for download
@@ -1672,16 +1826,23 @@ class FTPDownloaderGUI:
         # Start multiple scanner threads to discover files in parallel
         def scanner_thread(scanner_id):
             try:
+                # Create ftputil connection using the same custom session factory
                 if use_tls:
-                    scan_ftp = ftplib.FTP_TLS()
-                    scan_ftp.connect(host, port)
-                    scan_ftp.login(username, password)
-                    scan_ftp.prot_p()
+                    session_factory = create_no_utf8_session_factory(
+                        base_class=ftplib.FTP_TLS,
+                        port=port,
+                        use_passive_mode=True,
+                        encrypt_data_channel=True
+                    )
                 else:
-                    scan_ftp = ftplib.FTP()
-                    scan_ftp.connect(host, port)
-                    if username or password:
-                        scan_ftp.login(username, password)
+                    session_factory = create_no_utf8_session_factory(
+                        base_class=ftplib.FTP,
+                        port=port,
+                        use_passive_mode=True,
+                        encrypt_data_channel=False
+                    )
+                
+                scan_host = ftputil.FTPHost(host, username, password, session_factory=session_factory)
                 
                 with self.scanner_count_lock:
                     self.scanner_count += 1
@@ -1689,12 +1850,30 @@ class FTPDownloaderGUI:
                 self.root.after(0, lambda sid=scanner_id: self.log(f"Scanner {sid} connected, discovering files..."))
                 
                 # Try recursive LIST for PureFTPd (only first scanner attempts this)
+                # Use ftplib directly for this since it's a server-specific feature
                 if scanner_id == 1 and self.use_recursive_list and not self.recursive_list_attempted:
                     self.recursive_list_attempted = True
-                    if self._try_recursive_list(scan_ftp, remote_base, local_dir):
-                        # Recursive listing succeeded - log it but continue with standard scanners
-                        self.recursive_list_succeeded = True
-                        self.root.after(0, lambda: self.log("Recursive listing completed, standard scanners will verify completeness."))
+                    # Create a temporary ftplib connection for recursive LIST
+                    try:
+                        if use_tls:
+                            temp_ftp = ftplib.FTP_TLS()
+                            temp_ftp.connect(host, port)
+                            temp_ftp.login(username, password)
+                            temp_ftp.prot_p()
+                        else:
+                            temp_ftp = ftplib.FTP()
+                            temp_ftp.connect(host, port)
+                            if username or password:
+                                temp_ftp.login(username, password)
+                        
+                        if self._try_recursive_list(temp_ftp, remote_base, local_dir):
+                            # Recursive listing succeeded
+                            self.recursive_list_succeeded = True
+                            self.root.after(0, lambda: self.log("Recursive listing completed, standard scanners will verify completeness."))
+                        temp_ftp.quit()
+                    except Exception as e:
+                        # If recursive LIST fails, continue with standard scanning
+                        pass
                 
                 # Process directories from queue
                 while True:
@@ -1712,8 +1891,8 @@ class FTPDownloaderGUI:
                                 # Wait a bit and check again
                                 continue
                     
-                    # Scan this directory
-                    self._scan_and_queue_files(scan_ftp, current_path, remote_base, local_dir, dir_queue)
+                    # Scan this directory using ftputil
+                    self._scan_and_queue_files_ftputil(scan_host, current_path, remote_base, local_dir, dir_queue)
                     dir_queue.task_done()
                 
                 # Add any remaining files to treeview
@@ -1722,7 +1901,7 @@ class FTPDownloaderGUI:
                     if remaining:
                         self.root.after(0, lambda batch=remaining: self._batch_add_files_to_treeview(batch))
                 
-                scan_ftp.quit()
+                scan_host.close()
                 
                 with self.scanner_count_lock:
                     self.scanner_count -= 1
