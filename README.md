@@ -67,7 +67,10 @@ A multi-threaded GUI FTP downloader built with Python and tkinter. Perfect for a
 
 3. (Optional) Click **"Test Connection"** to verify connectivity and view server information
 
-4. Adjust the number of download threads (default: 4)
+4. Adjust download settings:
+   - **Number of Threads**: Number of parallel download workers (default: 4)
+   - **Number of Scanners**: Number of parallel file discovery scanners (default: 4)
+   - **Auto-retry failed downloads**: Automatically retry failed downloads during the download process
 
 5. Click **"Start Download"** to begin:
    - The application will automatically discover files as it scans
@@ -77,6 +80,10 @@ A multi-threaded GUI FTP downloader built with Python and tkinter. Perfect for a
    - Failed files are moved to the "Failed Downloads" listbox with error details
 
 6. Monitor progress in the statistics panel and log area
+
+7. **Retry Failed Downloads**: 
+   - If downloads fail, use the **"Retry Failed"** button to re-queue all failed downloads
+   - Or enable **"Auto-retry failed downloads"** to automatically retry failures during download
 
 ## Example: Downloading from modland.com
 
@@ -112,8 +119,9 @@ A multi-threaded GUI FTP downloader built with Python and tkinter. Perfect for a
 ## Tips
 
 - **Thread Count**: More threads = faster downloads, but too many may overwhelm the server. Start with 4-8 threads.
+- **Scanner Count**: More scanners = faster file discovery. For very large servers (100k+ files), 4-6 scanners work well. Too many may overwhelm the server.
 - **Large Servers**: For very large FTP servers, file discovery happens in real-time, so you can start monitoring immediately.
-- **PureFTPd Servers**: The application automatically detects and optimizes for PureFTPd servers using `LIST -R` for faster scanning.
+- **Retry Failed Downloads**: If some downloads fail, use the "Retry Failed" button after the download completes, or enable auto-retry to retry failures automatically.
 - **Resume**: If a download is interrupted, you can restart it - the application will skip files that already exist locally.
 - **File Navigation**: Currently downloading files automatically appear at the top of the list for easy monitoring.
 

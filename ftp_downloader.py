@@ -501,7 +501,8 @@ class FTPDownloaderGUI:
         self.current_downloads = {}  # Track currently downloading files
         self.downloading_items_moved = set()  # Track which items have been moved to top
         self.completed_downloads = []  # Track completed downloads
-        self.failed_downloads = []  # Track failed downloads
+        self.failed_downloads = []  # Track failed downloads as (remote_path, local_path) tuples
+        self.failed_downloads_dict = {}  # Track failed downloads: {remote_path: local_path}
         self.scanner_done = False  # Track if scanners have finished discovering files
         self.scanned_dirs = set()  # Track which directories have been scanned (for parallel scanners)
         self.scanned_dirs_lock = threading.Lock()  # Lock for scanned_dirs set
@@ -606,6 +607,17 @@ class FTPDownloaderGUI:
                                    textvariable=self.threads_var, width=10)
         threads_spin.grid(row=0, column=1, padx=5, pady=5)
         
+        # Number of scanners
+        ttk.Label(settings_frame, text="Number of Scanners:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
+        self.scanners_var = tk.IntVar(value=4)
+        scanners_spin = ttk.Spinbox(settings_frame, from_=1, to=10, 
+                                    textvariable=self.scanners_var, width=10)
+        scanners_spin.grid(row=0, column=3, padx=5, pady=5)
+        
+        # Retry failed downloads checkbox
+        self.retry_failed_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(settings_frame, text="Auto-retry failed downloads", 
+                       variable=self.retry_failed_var).grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
         
         
         # Control buttons
@@ -703,7 +715,13 @@ class FTPDownloaderGUI:
         failed_frame = ttk.Frame(paned)
         paned.add(failed_frame, weight=1)
         
-        ttk.Label(failed_frame, text="Failed Downloads", font=('', 9, 'bold')).pack(anchor=tk.W, pady=(0, 5))
+        failed_header_frame = ttk.Frame(failed_frame)
+        failed_header_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(failed_header_frame, text="Failed Downloads", font=('', 9, 'bold')).pack(side=tk.LEFT, anchor=tk.W)
+        self.retry_failed_button = ttk.Button(failed_header_frame, text="Retry Failed", 
+                                              command=self.retry_failed_downloads, state=tk.DISABLED)
+        self.retry_failed_button.pack(side=tk.RIGHT, padx=5)
+        
         failed_listbox_frame = ttk.Frame(failed_frame)
         failed_listbox_frame.pack(fill=tk.BOTH, expand=True)
         
@@ -975,6 +993,13 @@ class FTPDownloaderGUI:
             files_found = 0
             dirs_found = set()
             
+            # Debug: log first few lines to understand the format
+            if len(lines) > 0:
+                sample_lines = lines[:10] if len(lines) >= 10 else lines
+                self.root.after(0, lambda sample=sample_lines: self.log(f"Sample of first {len(sample)} lines from recursive listing (for debugging):"))
+                for i, sample_line in enumerate(sample_lines[:5]):  # Show first 5
+                    self.root.after(0, lambda sl=sample_line, idx=i: self.log(f"  [{idx}]: {sl[:100]}"))  # First 100 chars
+            
             for line in lines:
                 # Skip empty lines
                 if not line.strip():
@@ -986,10 +1011,22 @@ class FTPDownloaderGUI:
                 # - "path/to/dir:"
                 # - "./path/to/dir:"
                 # - Just a path without colon in some cases
-                if ':' in line:
-                    potential_dir = line.split(':')[0].strip()
-                    # Skip if it looks like a file entry (has permissions or starts with space)
-                    if potential_dir and not line.startswith(' ') and not potential_dir.startswith('-') and not potential_dir.startswith('d') and not potential_dir.startswith('l'):
+                # Directory headers typically end with ':' and don't start with permissions
+                line_stripped = line.strip()
+                
+                # Check if this looks like a directory path header (ends with ':' and doesn't look like a file entry)
+                if line_stripped.endswith(':'):
+                    potential_dir = line_stripped[:-1].strip()  # Remove trailing ':'
+                    # Skip if it looks like a file entry (starts with permissions like '-rw-' or 'drwx')
+                    # Directory headers don't start with file permissions
+                    if potential_dir and not (line_stripped.startswith('-') or 
+                                             line_stripped.startswith('d') or 
+                                             line_stripped.startswith('l') or
+                                             line_stripped.startswith('c') or
+                                             line_stripped.startswith('b') or
+                                             line_stripped.startswith('p') or
+                                             line_stripped.startswith('s') or
+                                             len(line_stripped.split()) > 1):  # File entries have multiple space-separated fields
                         # This is likely a directory path header
                         if potential_dir.startswith('/'):
                             current_dir = potential_dir
@@ -1016,15 +1053,78 @@ class FTPDownloaderGUI:
                         dirs_found.add(current_dir)
                         continue
                 
+                # Also check for directory headers without colon (some formats)
+                # If line doesn't start with permissions and doesn't have spaces, might be a path
+                if ':' not in line and not line_stripped.startswith(('-', 'd', 'l', 'c', 'b', 'p', 's')) and ' ' not in line_stripped:
+                    # Might be a directory path without colon - but be careful not to misidentify
+                    # Only treat as directory if it looks like a path (contains /)
+                    if '/' in line_stripped or line_stripped == '.' or line_stripped == '..':
+                        potential_dir = line_stripped
+                        if potential_dir.startswith('/'):
+                            current_dir = potential_dir
+                        elif potential_dir.startswith('.'):
+                            if potential_dir == '.':
+                                current_dir = remote_base.rstrip('/') or '/'
+                            else:
+                                clean_path = potential_dir.lstrip('./')
+                                if remote_base == '/':
+                                    current_dir = f"/{clean_path}" if clean_path else '/'
+                                else:
+                                    current_dir = f"{remote_base.rstrip('/')}/{clean_path}".replace('//', '/') if clean_path else remote_base
+                        else:
+                            if remote_base == '/':
+                                current_dir = f"/{potential_dir}" if potential_dir else '/'
+                            else:
+                                current_dir = f"{remote_base.rstrip('/')}/{potential_dir}".replace('//', '/') if potential_dir else remote_base
+                        current_dir = current_dir.replace('\\', '/').rstrip('/') or '/'
+                        dirs_found.add(current_dir)
+                        continue
+                
                 # Parse file/directory entry (starts with permissions like "drwxr-xr-x" or "-rw-r--r--")
+                # Try to parse as a file/directory entry
                 parts = line.split()
-                if len(parts) >= 9 and (parts[0].startswith('d') or parts[0].startswith('-')):
-                    name = ' '.join(parts[8:])
+                
+                # Check if this looks like a file entry (has permissions)
+                # File entries typically have at least 9 parts: permissions, links, owner, group, size, date, time, name
+                # But some formats might have fewer parts, so be more lenient
+                if len(parts) >= 5 and (parts[0].startswith('d') or parts[0].startswith('-') or 
+                                       parts[0].startswith('l') or parts[0].startswith('c') or 
+                                       parts[0].startswith('b') or parts[0].startswith('p') or 
+                                       parts[0].startswith('s')):
+                    # Extract name - it's usually the last part(s), but handle spaces in filenames
+                    # Try to find where the filename starts (usually after date/time)
+                    # Common format: permissions links owner group size month day time name
+                    # Or: permissions links owner group size date time name
+                    if len(parts) >= 9:
+                        # Standard format - name starts at index 8
+                        name = ' '.join(parts[8:])
+                    elif len(parts) >= 6:
+                        # Shorter format - name might be at the end
+                        # Try to detect: if parts[4] looks like a number (size), then parts[5+] is name
+                        try:
+                            int(parts[4])  # If this works, parts[4] is size
+                            name = ' '.join(parts[5:])
+                        except (ValueError, IndexError):
+                            # parts[4] is not a number, might be part of name
+                            name = ' '.join(parts[4:])
+                    else:
+                        # Very short format, just use last part as name
+                        name = parts[-1] if parts else ''
+                    
                     if name in ['.', '..']:
                         continue
                     
                     is_dir = parts[0].startswith('d')
-                    size = parts[4] if len(parts) > 4 else 'Unknown'
+                    # Try to get size
+                    try:
+                        if len(parts) >= 5:
+                            size = parts[4]
+                            # Try to convert to int to verify it's a size
+                            int(size)
+                        else:
+                            size = 'Unknown'
+                    except (ValueError, IndexError):
+                        size = 'Unknown'
                     
                     # Build full path
                     if current_dir == '/':
@@ -1104,14 +1204,20 @@ class FTPDownloaderGUI:
             
             # Log final count - use files_found which is accurate for this recursive listing
             self.root.after(0, lambda f=files_found, d=len(dirs_found): self.log(f"Recursive listing complete! Found {f} files in {d} directories."))
-            self.root.after(0, lambda: self.log("Recursive listing succeeded - standard scanners will verify completeness."))
+            self.root.after(0, lambda: self.log("Recursive listing succeeded - standard scanners will verify completeness and scan any missed directories."))
             
-            # Mark all found directories as scanned to prevent re-scanning
-            with self.scanned_dirs_lock:
-                for dir_path in dirs_found:
-                    self.scanned_dirs.add(dir_path)
+            # IMPORTANT: Don't mark directories as scanned - let standard scanners verify them
+            # The recursive listing parser is unreliable and misses many files, so we must let
+            # the standard scanners process all directories to ensure completeness
+            # The recursive listing helps by quickly queueing some files, but standard scanners
+            # will catch any directories/files that were missed due to parsing issues
             
-            return True
+            # DO NOT mark directories as scanned - this would prevent standard scanners from processing them
+            # with self.scanned_dirs_lock:
+            #     for dir_path in dirs_found:
+            #         self.scanned_dirs.add(dir_path)
+            
+            return True  # Return True to indicate recursive listing worked, but scanners will still verify
             
         except Exception as e:
             self.root.after(0, lambda: self.log(f"Recursive LIST failed, falling back to standard scanning: {str(e)}"))
@@ -1488,6 +1594,20 @@ class FTPDownloaderGUI:
         
         # Add to completed or failed listbox
         if status == "Completed":
+            # Remove from failed downloads if it was retried
+            if remote_path in self.failed_downloads:
+                self.failed_downloads.remove(remote_path)
+            if remote_path in self.failed_downloads_dict:
+                del self.failed_downloads_dict[remote_path]
+                # Remove from failed listbox
+                for i in range(self.failed_listbox.size() - 1, -1, -1):
+                    if self.failed_listbox.get(i).startswith(remote_path):
+                        self.failed_listbox.delete(i)
+                        break
+                # Update retry button state
+                if not self.failed_downloads_dict:
+                    self.retry_failed_button.config(state=tk.DISABLED)
+            
             if remote_path not in self.completed_downloads:
                 self.completed_downloads.append(remote_path)
                 self.completed_listbox.insert(tk.END, remote_path)
@@ -1496,11 +1616,132 @@ class FTPDownloaderGUI:
         elif status.startswith("Failed"):
             if remote_path not in self.failed_downloads:
                 self.failed_downloads.append(remote_path)
+                # Calculate local path for retry
+                local_dir = self.local_dir_entry.get().strip()
+                if remote_path.startswith('/'):
+                    rel_path = remote_path[1:]
+                else:
+                    rel_path = remote_path
+                local_path = os.path.join(local_dir, rel_path)
+                self.failed_downloads_dict[remote_path] = local_path
+                
                 error_msg = status.replace("Failed: ", "")
                 display_text = f"{remote_path} - {error_msg}"
                 self.failed_listbox.insert(tk.END, display_text)
                 # Auto-scroll to bottom
                 self.failed_listbox.see(tk.END)
+                
+                # Enable retry button if there are failed downloads
+                self.retry_failed_button.config(state=tk.NORMAL)
+                
+                # Auto-retry if enabled
+                if self.retry_failed_var.get() and self.is_downloading:
+                    # Queue the failed file for retry
+                    self.download_queue.put((remote_path, local_path))
+                    # Remove from failed list temporarily (will be re-added if it fails again)
+                    if remote_path in self.failed_downloads:
+                        self.failed_downloads.remove(remote_path)
+                    if remote_path in self.failed_downloads_dict:
+                        del self.failed_downloads_dict[remote_path]
+                    # Remove from listbox
+                    for i in range(self.failed_listbox.size() - 1, -1, -1):  # Iterate backwards
+                        if self.failed_listbox.get(i).startswith(remote_path):
+                            self.failed_listbox.delete(i)
+                            break
+                    # Re-add to treeview as pending
+                    if remote_path not in self.file_to_item:
+                        size = "Unknown"
+                        # Try to find size from file_list
+                        for fp, sz in self.file_list:
+                            if fp == remote_path:
+                                size = sz
+                                break
+                        item_id = self.tree.insert("", tk.END, text=remote_path, values=(size, "Pending", ""))
+                        self.file_to_item[remote_path] = item_id
+                    else:
+                        # Update status to Pending
+                        item_id = self.file_to_item[remote_path]
+                        current_values = self.tree.item(item_id, 'values')
+                        if current_values:
+                            size = current_values[0] if len(current_values) > 0 else "Unknown"
+                            self.tree.item(item_id, values=(size, "Pending", ""))
+                        # Remove failed tag
+                        self.tree.item(item_id, tags=())
+                    # Remove from downloaded_paths so it can be retried
+                    with self.stats['lock']:
+                        if 'downloaded_paths' in self.stats:
+                            self.stats['downloaded_paths'].discard(remote_path)
+                    self.log(f"Auto-retrying failed download: {remote_path}")
+    
+    def retry_failed_downloads(self):
+        """Retry all failed downloads"""
+        if not self.failed_downloads_dict:
+            messagebox.showinfo("Info", "No failed downloads to retry.")
+            return
+        
+        if self.is_downloading:
+            messagebox.showwarning("Warning", "Cannot retry while download is in progress. Please stop the download first.")
+            return
+        
+        retry_count = len(self.failed_downloads_dict)
+        self.log(f"Retrying {retry_count} failed downloads...")
+        
+        # Re-queue all failed downloads
+        for remote_path, local_path in list(self.failed_downloads_dict.items()):
+            # Remove from failed tracking
+            if remote_path in self.failed_downloads:
+                self.failed_downloads.remove(remote_path)
+            
+            # Remove from failed listbox
+            for i in range(self.failed_listbox.size() - 1, -1, -1):  # Iterate backwards to avoid index issues
+                if self.failed_listbox.get(i).startswith(remote_path):
+                    self.failed_listbox.delete(i)
+            
+            # Re-queue for download
+            self.download_queue.put((remote_path, local_path))
+            
+            # Re-add to treeview as pending if not already there
+            if remote_path not in self.file_to_item:
+                size = "Unknown"
+                # Try to find size from file_list
+                for fp, sz in self.file_list:
+                    if fp == remote_path:
+                        size = sz
+                        break
+                item_id = self.tree.insert("", tk.END, text=remote_path, values=(size, "Pending", ""))
+                self.file_to_item[remote_path] = item_id
+            else:
+                # Update status to Pending
+                item_id = self.file_to_item[remote_path]
+                current_values = self.tree.item(item_id, 'values')
+                if current_values:
+                    size = current_values[0] if len(current_values) > 0 else "Unknown"
+                    self.tree.item(item_id, values=(size, "Pending", ""))
+                # Remove failed tag
+                self.tree.item(item_id, tags=())
+            
+            # Remove from downloaded_paths so it can be retried
+            with self.stats['lock']:
+                if 'downloaded_paths' in self.stats:
+                    self.stats['downloaded_paths'].discard(remote_path)
+                # Reset stats for retry
+                if remote_path in [err.split(':')[0] for err in self.stats.get('errors', [])]:
+                    # Remove error for this file
+                    self.stats['errors'] = [e for e in self.stats['errors'] if not e.startswith(f"{remote_path}:")]
+        
+        # Clear failed downloads dict
+        self.failed_downloads_dict.clear()
+        
+        # Disable retry button
+        self.retry_failed_button.config(state=tk.DISABLED)
+        
+        # Update failed count in stats
+        with self.stats['lock']:
+            # Adjust failed count (subtract retried files)
+            self.stats['failed'] = max(0, self.stats['failed'] - retry_count)
+        
+        self.log(f"Queued {retry_count} files for retry. Click 'Start Download' to begin.")
+        messagebox.showinfo("Retry", f"Queued {retry_count} failed downloads for retry. Click 'Start Download' to begin.")
     
     def _remove_from_treeview(self, remote_path):
         """Remove a file from the treeview"""
@@ -1688,6 +1929,16 @@ class FTPDownloaderGUI:
                         self.download_button.config(state=tk.NORMAL)
                         self.stop_button.config(state=tk.DISABLED)
                         self.test_connection_button.config(state=tk.NORMAL)
+                        # Enable retry button if there are failed downloads
+                        if self.failed_downloads_dict:
+                            self.retry_failed_button.config(state=tk.NORMAL)
+                        else:
+                            self.retry_failed_button.config(state=tk.DISABLED)
+                        # Enable retry button if there are failed downloads
+                        if self.failed_downloads_dict:
+                            self.retry_failed_button.config(state=tk.NORMAL)
+                        else:
+                            self.retry_failed_button.config(state=tk.DISABLED)
                         
                         # Calculate final speed
                         final_speed = 0.0
@@ -1783,6 +2034,8 @@ class FTPDownloaderGUI:
         self.failed_listbox.delete(0, tk.END)
         self.completed_downloads = []
         self.failed_downloads = []
+        self.failed_downloads_dict.clear()
+        self.retry_failed_button.config(state=tk.DISABLED)
         
         # Reset completion tracking
         self.completion_dialog_shown = False
@@ -1790,7 +2043,7 @@ class FTPDownloaderGUI:
         self.downloading_items_moved.clear()  # Reset downloading items tracking
         
         self.log(f"Starting recursive download with {num_threads} parallel download workers")
-        num_scanners = 4  # Use 4 scanners for faster discovery
+        num_scanners = self.scanners_var.get()  # Get scanner count from settings
         self.log(f"{num_scanners} scanners will discover files in parallel, {num_threads} workers will download in parallel")
         
         # Strategy: Multiple scanner threads discover files in parallel and queue them
@@ -1804,8 +2057,9 @@ class FTPDownloaderGUI:
             self.scanner_count = 0
         
         # Try recursive LIST first for PureFTPd (much faster if supported)
+        # DISABLED: The recursive listing parser is missing many files, so we'll rely on standard scanners
         # This will be attempted by the first scanner
-        self.use_recursive_list = True  # Flag to try recursive listing
+        self.use_recursive_list = False  # Disabled - parser misses too many files
         self.recursive_list_attempted = False  # Track if we've tried it
         self.recursive_list_succeeded = False  # Track if recursive listing worked
         
@@ -2243,7 +2497,27 @@ class FTPDownloaderGUI:
         """Stop downloading"""
         self.is_downloading = False
         
-        # Stop wget process if running
+        # Stop all workers
+        for worker in self.workers:
+            worker.stop()
+        
+        # Wait for workers to finish
+        for worker in self.workers:
+            worker.join(timeout=2)
+        
+        # Re-enable buttons
+        self.download_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.test_connection_button.config(state=tk.NORMAL)
+        # Enable retry button if there are failed downloads
+        if self.failed_downloads_dict:
+            self.retry_failed_button.config(state=tk.NORMAL)
+        else:
+            self.retry_failed_button.config(state=tk.DISABLED)
+        
+        self.log("Download stopped by user")
+        
+        # Stop wget process if running (legacy code, may not be needed)
         if self.download_process:
             try:
                 self.download_process.terminate()
