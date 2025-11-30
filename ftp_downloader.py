@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
 import subprocess
 import os
+import sys
 import threading
 import queue
 import time
@@ -130,6 +131,8 @@ class DownloadWorker(threading.Thread):
                         self.stats['downloaded_paths'] = set()
                     if 'downloading_paths' not in self.stats:
                         self.stats['downloading_paths'] = set()
+                    if 'queued_files' not in self.stats:
+                        self.stats['queued_files'] = 0
                     
                     # Skip if already downloaded or currently downloading
                     if remote_path in self.stats['downloaded_paths']:
@@ -139,7 +142,8 @@ class DownloadWorker(threading.Thread):
                         self.download_queue.task_done()
                         continue
                     
-                    # Mark as downloading (total was already incremented when file was discovered)
+                    # Mark as downloading (file is now being processed)
+                    # Note: We don't decrement queued_files here because queue.qsize() is more accurate
                     self.stats['downloading_paths'].add(remote_path)
                 
                 try:
@@ -511,6 +515,7 @@ class FTPDownloaderGUI:
         self.scanner_count_lock = threading.Lock()  # Lock for scanner_count
         self.completion_dialog_shown = False  # Prevent showing dialog multiple times
         self.completion_checks_passed = 0  # Track consecutive successful completion checks
+        self.all_tree_items = set()  # Track all treeview items for search filtering
         
         # Load status images
         self.status_images = {}
@@ -642,7 +647,7 @@ class FTPDownloaderGUI:
         stats_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
         # Stats
-        self.stats_var = tk.StringVar(value="Files: 0 | Completed: 0 | Success: 0 | Failed: 0 | Speed: 0 B/s")
+        self.stats_var = tk.StringVar(value="Files: 0 | Total Size: Unknown | Progress: N/A | ETA: N/A | Completed: 0 | Pending: 0 | Failed: 0 | Speed: 0 B/s")
         ttk.Label(stats_frame, textvariable=self.stats_var).pack(anchor=tk.W)
         
         # Remove progress_var and progress_bar references - they're no longer needed
@@ -650,6 +655,17 @@ class FTPDownloaderGUI:
         # File list
         list_frame = ttk.LabelFrame(main_frame, text="Files to Download", padding="10")
         list_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        # Search/filter frame
+        search_frame = ttk.Frame(list_frame)
+        search_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(search_frame, text="Filter:").pack(side=tk.LEFT, padx=5)
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add('write', self._on_search_change)
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=30)
+        search_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        clear_search_button = ttk.Button(search_frame, text="Clear", command=self._clear_search)
+        clear_search_button.pack(side=tk.LEFT, padx=5)
         
         # Treeview for file list with scrollbars
         tree_frame = ttk.Frame(list_frame)
@@ -689,6 +705,14 @@ class FTPDownloaderGUI:
                 self.tree.tag_configure('success', image=self.status_images['success'])
             if 'failed' in self.status_images:
                 self.tree.tag_configure('failed', image=self.status_images['failed'])
+        
+        # Right-click context menu for treeview
+        self.tree_context_menu = tk.Menu(self.root, tearoff=0)
+        self.tree_context_menu.add_command(label="Copy File Path", command=self._copy_selected_path)
+        self.tree_context_menu.add_command(label="Open File Location", command=self._open_selected_file_location)
+        self.tree_context_menu.add_command(label="Retry Download", command=self._retry_selected_file)
+        self.tree.bind("<Button-3>", self._on_treeview_right_click)  # Right-click
+        self.tree.bind("<Button-2>", self._on_treeview_right_click)  # Mac right-click
         
         # Completed and Failed downloads frame
         results_frame = ttk.LabelFrame(main_frame, text="Download Results", padding="10")
@@ -736,6 +760,13 @@ class FTPDownloaderGUI:
         log_frame = ttk.LabelFrame(main_frame, text="Log", padding="10")
         log_frame.grid(row=6, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
         
+        # Log controls frame
+        log_controls_frame = ttk.Frame(log_frame)
+        log_controls_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        clear_log_button = ttk.Button(log_controls_frame, text="Clear Log", command=self.clear_log)
+        clear_log_button.pack(side=tk.RIGHT, padx=5)
+        
         self.log_text = scrolledtext.ScrolledText(log_frame, height=6, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
@@ -747,11 +778,24 @@ class FTPDownloaderGUI:
         main_frame.rowconfigure(5, weight=1)
         main_frame.rowconfigure(6, weight=1)
         
+        # Keyboard shortcuts
+        self.root.bind('<Return>', lambda e: self.start_download() if not self.is_downloading else None)
+        self.root.bind('<Escape>', lambda e: self.stop_download() if self.is_downloading else None)
+        self.root.bind('<Control-c>', self._copy_selected_path_keyboard)
+        self.root.bind('<Control-f>', lambda e: search_entry.focus())
+        
+        # System tray setup (Windows only for now)
+        self._setup_system_tray()
+        
     def log(self, message):
         """Add message to log"""
         self.log_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
         self.log_text.see(tk.END)
         self.root.update_idletasks()
+    
+    def clear_log(self):
+        """Clear the log area"""
+        self.log_text.delete(1.0, tk.END)
         
     def browse_directory(self):
         """Browse for local directory"""
@@ -759,6 +803,272 @@ class FTPDownloaderGUI:
         if directory:
             self.local_dir_entry.delete(0, tk.END)
             self.local_dir_entry.insert(0, directory)
+    
+    def open_local_folder(self):
+        """Open the local download directory in file explorer"""
+        local_dir = self.local_dir_entry.get().strip()
+        if not local_dir:
+            messagebox.showwarning("Warning", "Please specify a local directory first.")
+            return
+        
+        if not os.path.exists(local_dir):
+            messagebox.showwarning("Warning", f"Directory does not exist:\n{local_dir}")
+            return
+        
+        # Open folder in file explorer (Windows)
+        try:
+            os.startfile(local_dir)
+        except AttributeError:
+            # Linux/Mac fallback
+            try:
+                subprocess.Popen(['xdg-open', local_dir])
+            except:
+                try:
+                    subprocess.Popen(['open', local_dir])
+                except:
+                    messagebox.showerror("Error", "Could not open folder. Please open manually.")
+    
+    def _on_search_change(self, *args):
+        """Handle search/filter text change"""
+        search_text = self.search_var.get().lower()
+        
+        # Get all items from our tracking set (includes both attached and detached)
+        all_items = list(self.all_tree_items) if hasattr(self, 'all_tree_items') else []
+        
+        # If we don't have tracking, build it from current treeview
+        if not all_items:
+            all_items = list(self.tree.get_children(''))
+            self.all_tree_items = set(all_items)
+        
+        # Detach all items first
+        for item_id in list(self.tree.get_children('')):
+            try:
+                self.tree.detach(item_id)
+            except:
+                pass
+        
+        # Re-attach items that match search
+        if not search_text:
+            # Show all files
+            for item_id in all_items:
+                try:
+                    self.tree.reattach(item_id, '', 'end')
+                except:
+                    pass
+        else:
+            # Only show matching files
+            for item_id in all_items:
+                try:
+                    file_path = self.tree.item(item_id, 'text')
+                    if search_text in file_path.lower():
+                        self.tree.reattach(item_id, '', 'end')
+                except:
+                    pass
+    
+    def _clear_search(self):
+        """Clear the search filter"""
+        self.search_var.set("")
+        # Re-attach all items
+        for item_id in self.tree.get_children():
+            self.tree.reattach(item_id, '', 'end')
+    
+    def _on_treeview_right_click(self, event):
+        """Handle right-click on treeview"""
+        item = self.tree.selection()[0] if self.tree.selection() else None
+        if item:
+            # Enable/disable menu items based on context
+            file_path = self.tree.item(item, 'text')
+            values = self.tree.item(item, 'values')
+            status = values[1] if len(values) > 1 else ""
+            
+            # Enable retry only if failed
+            self.tree_context_menu.entryconfig("Retry Download", 
+                state=tk.NORMAL if status.startswith("Failed") else tk.DISABLED)
+            
+            self.tree_context_menu.post(event.x_root, event.y_root)
+    
+    def _copy_selected_path(self):
+        """Copy selected file path to clipboard"""
+        selection = self.tree.selection()
+        if selection:
+            file_path = self.tree.item(selection[0], 'text')
+            self.root.clipboard_clear()
+            self.root.clipboard_append(file_path)
+    
+    def _copy_selected_path_keyboard(self, event):
+        """Copy selected file path to clipboard (keyboard shortcut)"""
+        self._copy_selected_path()
+        return "break"  # Prevent default behavior
+    
+    def _open_selected_file_location(self):
+        """Open the location of the selected file"""
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        file_path = self.tree.item(selection[0], 'text')
+        local_dir = self.local_dir_entry.get().strip()
+        
+        # Find the local path for this file
+        local_path = None
+        for remote_path, local_path_item in self.failed_downloads_dict.items():
+            if remote_path == file_path:
+                local_path = local_path_item
+                break
+        
+        if not local_path:
+            # Try to construct from remote path
+            if file_path.startswith('/'):
+                rel_path = file_path[1:]
+            else:
+                rel_path = file_path
+            local_path = os.path.join(local_dir, rel_path)
+        
+        # Open the directory containing the file
+        if os.path.exists(local_path):
+            folder_path = os.path.dirname(local_path)
+            try:
+                os.startfile(folder_path)
+            except AttributeError:
+                try:
+                    subprocess.Popen(['xdg-open', folder_path])
+                except:
+                    try:
+                        subprocess.Popen(['open', folder_path])
+                    except:
+                        messagebox.showerror("Error", "Could not open folder.")
+        else:
+            messagebox.showwarning("Warning", f"File not found:\n{local_path}")
+    
+    def _retry_selected_file(self):
+        """Retry downloading the selected file"""
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        file_path = self.tree.item(selection[0], 'text')
+        
+        # Find local path
+        local_path = None
+        if file_path in self.failed_downloads_dict:
+            local_path = self.failed_downloads_dict[file_path]
+        else:
+            # Construct from remote path
+            local_dir = self.local_dir_entry.get().strip()
+            if file_path.startswith('/'):
+                rel_path = file_path[1:]
+            else:
+                rel_path = file_path
+            local_path = os.path.join(local_dir, rel_path)
+        
+        if local_path:
+            # Re-queue for download
+            self.download_queue.put((file_path, local_path))
+            # Track queued files
+            with self.stats['lock']:
+                if 'queued_files' not in self.stats:
+                    self.stats['queued_files'] = 0
+                self.stats['queued_files'] += 1
+            # Remove from failed tracking
+            if file_path in self.failed_downloads_dict:
+                del self.failed_downloads_dict[file_path]
+            # Update status
+            if file_path in self.file_to_item:
+                item_id = self.file_to_item[file_path]
+                current_values = self.tree.item(item_id, 'values')
+                if current_values:
+                    size = current_values[0] if len(current_values) > 0 else "Unknown"
+                    self.tree.item(item_id, values=(size, "Pending", ""))
+            self.log(f"Re-queued file for retry: {file_path}")
+    
+    def _setup_system_tray(self):
+        """Setup system tray icon (Windows only)"""
+        try:
+            import pystray
+            from PIL import Image
+            
+            # Try to load the actual icon file
+            icon_path = os.path.join(os.path.dirname(__file__), "donload.png")
+            if os.path.exists(icon_path):
+                try:
+                    image = Image.open(icon_path)
+                    # Resize to appropriate size for tray icon (usually 16x16 or 32x32)
+                    image = image.resize((64, 64), Image.Resampling.LANCZOS)
+                except Exception:
+                    # Fallback to simple icon if loading fails
+                    image = Image.new('RGB', (64, 64), color='white')
+                    from PIL import ImageDraw
+                    draw = ImageDraw.Draw(image)
+                    draw.ellipse([16, 16, 48, 48], fill='blue')
+            else:
+                # Fallback to simple icon if file doesn't exist
+                image = Image.new('RGB', (64, 64), color='white')
+                from PIL import ImageDraw
+                draw = ImageDraw.Draw(image)
+                draw.ellipse([16, 16, 48, 48], fill='blue')
+            
+            # Create menu
+            menu = pystray.Menu(
+                pystray.MenuItem('Show', self._show_window),
+                pystray.MenuItem('Hide', self._hide_window),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem('Exit', self._quit_app)
+            )
+            
+            self.tray_icon = pystray.Icon("ftp donloader", image, "ftp donloader", menu)
+            
+            # Start tray icon in a separate thread
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+            
+            # Handle window close to minimize to tray
+            self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+            
+        except ImportError:
+            # pystray not available, skip tray icon
+            self.tray_icon = None
+        except Exception as e:
+            # Any other error, skip tray icon
+            self.tray_icon = None
+    
+    def _show_window(self, icon=None, item=None):
+        """Show the main window"""
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+    
+    def _hide_window(self, icon=None, item=None):
+        """Hide the main window"""
+        self.root.withdraw()
+    
+    def _on_closing(self):
+        """Handle window closing - minimize to tray if available"""
+        if self.tray_icon:
+            self._hide_window()
+        else:
+            self._quit_app()
+    
+    def _quit_app(self, icon=None, item=None):
+        """Quit the application"""
+        if self.tray_icon:
+            self.tray_icon.stop()
+        self.root.quit()
+        self.root.destroy()
+    
+    def _show_tray_notification(self, title, message, duration=5):
+        """Show a system tray notification (Windows balloon)"""
+        try:
+            # Windows-specific notification
+            if sys.platform == 'win32':
+                try:
+                    import win10toast
+                    toaster = win10toast.ToastNotifier()
+                    toaster.show_toast(title, message, duration=duration, threaded=True)
+                except ImportError:
+                    # Fallback to pystray notification if available
+                    if self.tray_icon:
+                        self.tray_icon.notify(message, title)
+        except:
+            pass
     
     def test_connection(self):
         """Test FTP connection and try to get server statistics"""
@@ -836,9 +1146,10 @@ class FTPDownloaderGUI:
                 self.root.after(0, lambda msg=success_msg: messagebox.showinfo("Success", msg))
                 
             except Exception as e:
-                self.root.after(0, lambda: self.log(f"✗ Connection failed: {str(e)}"))
+                error_msg = str(e)
+                self.root.after(0, lambda msg=error_msg: self.log(f"✗ Connection failed: {msg}"))
                 self.root.after(0, lambda: self.test_connection_button.config(state=tk.NORMAL))
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Connection failed: {str(e)}"))
+                self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", f"Connection failed: {msg}"))
         
         threading.Thread(target=test_thread, daemon=True).start()
     
@@ -1183,6 +1494,11 @@ class FTPDownloaderGUI:
                         # Queue it
                         files_found += 1
                         self.download_queue.put((remote_path, local_path))
+                        # Track queued files
+                        with self.stats['lock']:
+                            if 'queued_files' not in self.stats:
+                                self.stats['queued_files'] = 0
+                            self.stats['queued_files'] += 1
                         
                         # Update file list
                         self.file_list.append((remote_path, size))
@@ -1335,6 +1651,11 @@ class FTPDownloaderGUI:
                 
                 # Add to queue
                 self.download_queue.put((remote_path, local_path))
+                # Track queued files
+                with self.stats['lock']:
+                    if 'queued_files' not in self.stats:
+                        self.stats['queued_files'] = 0
+                    self.stats['queued_files'] += 1
                 
                 # Update file list for UI
                 size = info.get('size', 'Unknown')
@@ -1509,6 +1830,11 @@ class FTPDownloaderGUI:
                 
                 # Add to queue
                 self.download_queue.put((remote_path, local_path))
+                # Track queued files
+                with self.stats['lock']:
+                    if 'queued_files' not in self.stats:
+                        self.stats['queued_files'] = 0
+                    self.stats['queued_files'] += 1
                 
                 # Update file list for UI
                 size = info.get('size', 'Unknown')
@@ -1551,6 +1877,9 @@ class FTPDownloaderGUI:
         if remote_path not in self.file_to_item:
             item_id = self.tree.insert("", tk.END, text=remote_path, values=(size, "Pending", ""))
             self.file_to_item[remote_path] = item_id
+            # Track for search filtering
+            if hasattr(self, 'all_tree_items'):
+                self.all_tree_items.add(item_id)
     
     def _batch_add_files_to_treeview(self, file_batch):
         """Add multiple files to treeview in a batch for better performance"""
@@ -1558,6 +1887,9 @@ class FTPDownloaderGUI:
             if remote_path not in self.file_to_item:
                 item_id = self.tree.insert("", tk.END, text=remote_path, values=(size, "Pending", ""))
                 self.file_to_item[remote_path] = item_id
+                # Track for search filtering
+                if hasattr(self, 'all_tree_items'):
+                    self.all_tree_items.add(item_id)
     
     def _update_file_list(self):
         """Update file list display (rebuilds entire list - used for initial scan)"""
@@ -1666,6 +1998,11 @@ class FTPDownloaderGUI:
                 if self.retry_failed_var.get() and self.is_downloading:
                     # Queue the failed file for retry
                     self.download_queue.put((remote_path, local_path))
+                    # Track queued files
+                    with self.stats['lock']:
+                        if 'queued_files' not in self.stats:
+                            self.stats['queued_files'] = 0
+                        self.stats['queued_files'] += 1
                     # Remove from failed list temporarily (will be re-added if it fails again)
                     if remote_path in self.failed_downloads:
                         self.failed_downloads.remove(remote_path)
@@ -1727,6 +2064,11 @@ class FTPDownloaderGUI:
             
             # Re-queue for download
             self.download_queue.put((remote_path, local_path))
+            # Track queued files
+            with self.stats['lock']:
+                if 'queued_files' not in self.stats:
+                    self.stats['queued_files'] = 0
+                self.stats['queued_files'] += 1
             
             # Re-add to treeview as pending if not already there
             if remote_path not in self.file_to_item:
@@ -1777,8 +2119,10 @@ class FTPDownloaderGUI:
             item_id = self.file_to_item[remote_path]
             self.tree.delete(item_id)
             del self.file_to_item[remote_path]
-            # Also remove from downloading items tracking
+            # Also remove from downloading items tracking and search tracking
             self.downloading_items_moved.discard(remote_path)
+            if hasattr(self, 'all_tree_items'):
+                self.all_tree_items.discard(item_id)
     
     def update_progress(self):
         """Update progress bar and stats"""
@@ -1855,10 +2199,35 @@ class FTPDownloaderGUI:
         # Get total size and format it
         with self.stats['lock']:
             total_size = self.stats.get('total_size', 0)
+            bytes_downloaded = self.stats.get('bytes_downloaded', 0)
         total_size_str = self._format_size(total_size) if total_size > 0 else "Unknown"
         
-        # Update stats (always include speed and total size)
-        self.stats_var.set(f"Files: {total} | Total Size: {total_size_str} | Completed: {completed} | Success: {success} | Failed: {failed} | Speed: {speed_str}")
+        # Calculate progress percentage
+        progress_percent = 0.0
+        if total_size > 0:
+            progress_percent = (bytes_downloaded / total_size) * 100
+        progress_str = f"{progress_percent:.1f}%" if total_size > 0 else "N/A"
+        
+        # Calculate ETA (time remaining)
+        eta_str = "N/A"
+        if speed > 0 and total_size > 0:
+            remaining_bytes = total_size - bytes_downloaded
+            if remaining_bytes > 0:
+                eta_seconds = remaining_bytes / speed
+                if eta_seconds < 60:
+                    eta_str = f"{int(eta_seconds)}s"
+                elif eta_seconds < 3600:
+                    eta_str = f"{int(eta_seconds / 60)}m {int(eta_seconds % 60)}s"
+                else:
+                    hours = int(eta_seconds / 3600)
+                    minutes = int((eta_seconds % 3600) / 60)
+                    eta_str = f"{hours}h {minutes}m"
+        
+        # Calculate pending files (total - completed - failed)
+        pending = max(0, total - completed - failed)
+        
+        # Update stats (always include speed, total size, progress, and ETA)
+        self.stats_var.set(f"Files: {total} | Total Size: {total_size_str} | Progress: {progress_str} | ETA: {eta_str} | Completed: {completed} | Pending: {pending} | Failed: {failed} | Speed: {speed_str}")
         
         if is_complete:
             # Increment consecutive completion checks
@@ -1875,7 +2244,7 @@ class FTPDownloaderGUI:
         else:
             # Reset counter if not complete - any activity resets the count
             self.completion_checks_passed = 0
-            # Schedule next update
+            # Schedule next update (always update status bar)
             self.root.after(500, self.update_progress)
     
     def _final_completion_check(self):
@@ -1998,7 +2367,17 @@ class FTPDownloaderGUI:
                         final_total_size_str = self._format_size(final_total_size) if final_total_size > 0 else "Unknown"
                         
                         # Update stats one final time (include speed and total size)
-                        self.stats_var.set(f"Files: {final_total} | Total Size: {final_total_size_str} | Completed: {final_completed} | Success: {final_success} | Failed: {final_failed} | Speed: {final_speed_str}")
+                        # Calculate final progress
+                        with self.stats['lock']:
+                            final_total_size = self.stats.get('total_size', 0)
+                            final_bytes_downloaded = self.stats.get('bytes_downloaded', 0)
+                        final_progress_percent = 0.0
+                        if final_total_size > 0:
+                            final_progress_percent = (final_bytes_downloaded / final_total_size) * 100
+                        final_progress_str = f"{final_progress_percent:.1f}%" if final_total_size > 0 else "N/A"
+                        
+                        final_pending = max(0, final_total - final_completed - final_failed)
+                        self.stats_var.set(f"Files: {final_total} | Total Size: {final_total_size_str} | Progress: {final_progress_str} | Completed: {final_completed} | Pending: {final_pending} | Failed: {final_failed} | Speed: {final_speed_str}")
                         
                         if final_errors:
                             self.log(f"Download complete with {len(final_errors)} errors")
@@ -2008,7 +2387,13 @@ class FTPDownloaderGUI:
                         # Only show dialog once
                         if not self.completion_dialog_shown:
                             self.completion_dialog_shown = True
-                            messagebox.showinfo("Complete", f"Download finished!\nSuccess: {final_success}\nFailed: {final_failed}")
+                            # Show tray notification
+                            self._show_tray_notification(
+                                "Download Complete",
+                                f"Completed: {final_completed}, Failed: {final_failed}",
+                                duration=10
+                            )
+                            messagebox.showinfo("Complete", f"Download finished!\nCompleted: {final_completed}\nFailed: {final_failed}")
                     else:
                         # Final check failed, continue monitoring
                         self.completion_checks_passed = 0
@@ -2058,6 +2443,7 @@ class FTPDownloaderGUI:
             self.stats['errors'] = []
             self.stats['bytes_downloaded'] = 0
             self.stats['total_size'] = 0  # Total size of all files to download
+            self.stats['queued_files'] = 0  # Count of files that have been queued
             self.stats['download_start_time'] = time.time()
             self.stats['last_bytes'] = 0
             self.stats['last_speed_time'] = time.time()
@@ -2075,6 +2461,9 @@ class FTPDownloaderGUI:
         self.failed_downloads = []
         self.failed_downloads_dict.clear()
         self.retry_failed_button.config(state=tk.DISABLED)
+        # Reset search tracking
+        if hasattr(self, 'all_tree_items'):
+            self.all_tree_items.clear()
         
         # Reset completion tracking
         self.completion_dialog_shown = False
@@ -2106,6 +2495,9 @@ class FTPDownloaderGUI:
         dir_queue = queue.Queue()
         dir_queue.put(remote_base)  # Start with base directory
         
+        # Set downloading flag first
+        self.is_downloading = True
+        
         # Start download workers first (they'll wait for queue items)
         self.workers = []
         for i in range(num_threads):
@@ -2115,6 +2507,9 @@ class FTPDownloaderGUI:
             worker.start()
             self.workers.append(worker)
             self.log(f"Download worker {i} started")
+        
+        # Start regular progress updates
+        self.update_progress()
         
         # Start multiple scanner threads to discover files in parallel
         def scanner_thread(scanner_id):
@@ -2342,6 +2737,11 @@ class FTPDownloaderGUI:
                                 
                                 local_path = os.path.join(local_dir, rel_path)
                                 self.download_queue.put((remote_path, local_path))
+                                # Track queued files
+                                with self.stats['lock']:
+                                    if 'queued_files' not in self.stats:
+                                        self.stats['queued_files'] = 0
+                                    self.stats['queued_files'] += 1
                                 
                                 # Update UI immediately
                                 self.root.after(0, lambda p=remote_path, s=size: self._add_file_to_treeview(p, s))
@@ -2420,9 +2820,33 @@ class FTPDownloaderGUI:
         # Get total size and format it
         with self.stats['lock']:
             total_size = self.stats.get('total_size', 0)
+            bytes_downloaded = self.stats.get('bytes_downloaded', 0)
         total_size_str = self._format_size(total_size) if total_size > 0 else "Unknown"
         
-        self.stats_var.set(f"Files: {total} | Total Size: {total_size_str} | Completed: {completed} | Success: {success} | Failed: {failed} | Speed: {speed_str}")
+        # Calculate progress percentage
+        progress_percent = 0.0
+        if total_size > 0:
+            progress_percent = (bytes_downloaded / total_size) * 100
+        progress_str = f"{progress_percent:.1f}%" if total_size > 0 else "N/A"
+        
+        # Calculate ETA
+        eta_str = "N/A"
+        if speed > 0 and total_size > 0:
+            remaining_bytes = total_size - bytes_downloaded
+            if remaining_bytes > 0:
+                eta_seconds = remaining_bytes / speed
+                if eta_seconds < 60:
+                    eta_str = f"{int(eta_seconds)}s"
+                elif eta_seconds < 3600:
+                    eta_str = f"{int(eta_seconds / 60)}m {int(eta_seconds % 60)}s"
+                else:
+                    hours = int(eta_seconds / 3600)
+                    minutes = int((eta_seconds % 3600) / 60)
+                    eta_str = f"{hours}h {minutes}m"
+        
+        # Calculate pending files (total - completed - failed)
+        pending = max(0, total - completed - failed)
+        self.stats_var.set(f"Files: {total} | Total Size: {total_size_str} | Progress: {progress_str} | ETA: {eta_str} | Completed: {completed} | Pending: {pending} | Failed: {failed} | Speed: {speed_str}")
         
         # Check if done
         if completed >= total and total > 0:
@@ -2439,7 +2863,7 @@ class FTPDownloaderGUI:
             else:
                 self.log("Download complete!")
             
-            messagebox.showinfo("Complete", f"Download finished!\nSuccess: {success}\nFailed: {failed}")
+            messagebox.showinfo("Complete", f"Download finished!\nCompleted: {completed}\nFailed: {failed}")
         else:
             # Schedule next update
             self.root.after(500, self.update_progress)
@@ -2518,8 +2942,9 @@ class FTPDownloaderGUI:
                     self.root.after(0, lambda: messagebox.showwarning("Warning", f"Download finished with return code {return_code}"))
                 
             except Exception as e:
-                self.root.after(0, lambda: self.log(f"Error: {str(e)}"))
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Download failed: {str(e)}"))
+                error_msg = str(e)
+                self.root.after(0, lambda msg=error_msg: self.log(f"Error: {msg}"))
+                self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", f"Download failed: {msg}"))
             finally:
                 self.root.after(0, self._download_finished)
         

@@ -112,8 +112,8 @@ A multi-threaded GUI FTP downloader built with Python and tkinter. Perfect for a
 
 3. **Progress Tracking**: 
    - Monitors completion status and updates the GUI in real-time
-   - Calculates and displays overall download speed
-   - Shows per-file status and speed
+   - Statistics panel shows: Files, Total Size, Progress percentage, ETA, Completed count, Pending count, Failed count, and current Speed
+   - Shows per-file status and speed in the file list
    - Automatically detects completion when all files are downloaded
 
 ## Tips
